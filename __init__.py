@@ -1,0 +1,136 @@
+"""vllm kunlun init"""
+
+import builtins
+import importlib
+import logging
+import os
+import sys
+
+from vllm.logger import init_logger as init_vllm_logger
+
+OLD_IMPORT_HOOK = builtins.__import__
+
+
+def _configure_kunlun_logger() -> logging.Logger:
+    """Reuse vLLM's handler for the vllm_kunlun logger tree."""
+    vllm_logger = init_vllm_logger("vllm")
+    kunlun_logger = logging.getLogger("vllm_kunlun")
+
+    if not kunlun_logger.handlers:
+        for handler in vllm_logger.handlers:
+            kunlun_logger.addHandler(handler)
+
+    kunlun_logger.setLevel(vllm_logger.getEffectiveLevel())
+    kunlun_logger.propagate = False
+    return kunlun_logger
+
+
+def _custom_import(module_name, globals=None, locals=None, fromlist=(), level=0):
+    try:
+        module_mappings = {
+            "vllm.compilation.wrapper": "vllm_kunlun.compilation.wrapper",
+            "vllm.v1.worker.utils": "vllm_kunlun.v1.worker.utils",
+            "vllm.model_executor.model_loader.bitsandbytes_loader": "vllm_kunlun.models.model_loader.bitsandbytes_loader",
+            "vllm.v1.sample.ops.topk_topp_sampler": "vllm_kunlun.v1.sample.ops.topk_topp_sampler",
+            "vllm.v1.sample.rejection_sampler": "vllm_kunlun.v1.sample.rejection_sampler",
+            "vllm.attention.ops.merge_attn_states": "vllm_kunlun.ops.attention.merge_attn_states",
+            "vllm.model_executor.models.config": "vllm_kunlun.models.config",
+        }
+
+        if module_name in module_mappings:
+            if module_name in sys.modules:
+                return sys.modules[module_name]
+            target_module = module_mappings[module_name]
+            module = importlib.import_module(target_module)
+            sys.modules[module_name] = module
+            sys.modules[target_module] = module
+    except Exception:
+        pass
+
+    return OLD_IMPORT_HOOK(
+        module_name, globals=globals, locals=locals, fromlist=fromlist, level=level
+    )
+
+
+def import_hook():
+    """Apply import hook for VLLM Kunlun"""
+    builtins.__import__ = _custom_import
+
+
+def register():
+    """Register the Kunlun platform"""
+
+    logger = _configure_kunlun_logger()
+    logger.info("[KunlunPlugin] register() pid=%s", os.getpid())
+
+    # --- load native extension to register torch.ops._C.weak_ref_tensor ---
+    try:
+        from . import _kunlun  # noqa: F401
+
+        logger.info("[KunlunPlugin] _kunlun native extension loaded")
+    except ImportError as e:
+        logger.warning("[KunlunPlugin] Failed to load _kunlun: %s", e)
+
+    # --- import wrapper & patch utils ---
+    try:
+        from .schema import direct_register_custom_op  # noqa: F401
+        from .schema import patch_annotations_for_schema  # noqa: F401
+
+        logger.info("[KunlunPlugin] vllm_utils_wrapper loaded and patched")
+    except Exception:
+        logger.exception("[KunlunPlugin] wrapper import/patch failed")
+        raise
+
+    # TODO @xyDong0223 Fix Hear, import failed in v15.1
+    # --- optional GLM5 config patch ---
+    # if "vllm.transformers_utils.config" in sys.modules:
+    #     from .transformer_utils.config import _XPU_CONFIG_REGISTRY
+    #     sys.modules["vllm.transformers_utils.config"]._CONFIG_REGISTRY = _XPU_CONFIG_REGISTRY
+    #     logger.info("[KunlunPlugin] patched transformers_utils.config")
+
+    # --- patch ModelConfig ---
+    # try:
+    #     import vllm.config.model as model_module
+    #     from .config.model import is_deepseek_mla
+    #     model_module.ModelConfig.is_deepseek_mla = property(is_deepseek_mla)
+    #     logger.info("[KunlunPlugin] patched ModelConfig.is_deepseek_mla")
+    # except Exception:
+    #     logger.exception("[KunlunPlugin] ModelConfig patch failed")
+    #     raise
+
+    # --- import hook ---
+    try:
+        import_hook()
+        logger.info("[KunlunPlugin] import_hook() ok")
+    except Exception:
+        logger.exception("[KunlunPlugin] import_hook() failed")
+        raise
+
+    # --- register reasoning parser override (lazy, to avoid circular import) ---
+    try:
+        from vllm.reasoning import ReasoningParserManager
+
+        # Override the lazy registration path with our custom parser.
+        # This happens before vllm's default lazy registration (which is
+        # triggered when vllm.reasoning module is imported), so our path
+        # takes precedence.
+        # Custom parser for Qwen3.5 support
+        ReasoningParserManager.register_lazy_module(
+            name="qwen3",
+            module_path="vllm_kunlun.reasoning.qwen3_reasoning_parser",
+            class_name="Qwen3ReasoningParser",
+        )
+        logger.info("[KunlunPlugin] registered Qwen3ReasoningParser override (lazy)")
+    except Exception:
+        logger.exception("[KunlunPlugin] Qwen3ReasoningParser registration failed")
+        # Non-fatal: continue without the override
+
+    logger.info("[KunlunPlugin] register() done")
+    return "vllm_kunlun.platforms.kunlun.KunlunPlatform"
+
+
+def register_model():
+    """Register models for training and inference"""
+    from .models import register_model as _reg
+
+    _reg()
