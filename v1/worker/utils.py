@@ -18,7 +18,8 @@ from vllm.v1.kv_cache_interface import KVCacheGroupSpec, KVCacheSpec
 
 if TYPE_CHECKING:
     from vllm.attention.layer import Attention
-
+import logging
+logger = logging.getLogger(__name__)
 
 class MultiModalBudget:
     """Helper class to calculate budget information for multi-modal models."""
@@ -266,6 +267,7 @@ def bind_kv_cache(
     forward_context: dict[str, "Attention"],
     runner_kv_caches: list[torch.Tensor],
     num_attn_module: Optional[int] = 1,
+    kv_cache_quant_mode: str = "dynamic",
 ) -> None:
     """
     Bind the allocated KV cache to both ModelRunner and forward context so
@@ -276,12 +278,16 @@ def bind_kv_cache(
          kv_caches.
       2) Associates each attention layer in the `forward_context` with its
          corresponding KV cache in kv_caches.
+      3) For int8 KV cache with dynamic quantization: allocates per-token
+         per-head scale buffers (`_kv_cache_scale`) alongside the KV cache.
 
     Args:
         kv_caches: The allocated kv_caches with layer names as keys.
         forward_context: The global forward context containing all Attention
             layers with layer names as keys.
         runner_kv_caches: The kv_cache declared by ModelRunner.
+        kv_cache_quant_mode: "dynamic" to allocate per-token scale buffer,
+            "static" to use _k_scale/_v_scale from checkpoint.
     """
     # Bind kv_caches to ModelRunner
     assert len(runner_kv_caches) == 0
@@ -294,21 +300,11 @@ def bind_kv_cache(
     for layer_index in sorted(index2name.keys()):
         layer_names = index2name[layer_index]
         if len(layer_names) > 1:
-            # One typical case is encoder-decoder model, e.g., bart.
-            # The cross attention and self attention in the same decoder layer
-            # has different layer_name but the same layer_index.
-
-            # TODO - analyze where runner_kv_caches is used and the right
-            # way to ensure it properly reflects multiple attention layers
-            # in the same decoder block.
             if (
                 current_platform.is_kunlun()
                 or current_platform.is_cuda()
                 or current_platform.is_xpu()
             ):
-                # We know that the GPU runner is not impacted by this
-                # case. Some test code depends on runner_kv_caches, but
-                # not in a way that's impacted by ignoring this.
                 pass
             else:
                 raise NotImplementedError
@@ -319,6 +315,67 @@ def bind_kv_cache(
     for layer_name, kv_cache in kv_caches.items():
         # NOTE: Use list because of v0 PP virtual engine.
         forward_context[layer_name].kv_cache = [kv_cache]
+
+    # Allocate per-token per-head scale buffers for int8 KV cache layers
+    _allocate_kv_cache_scale_buffers(kv_caches, forward_context, kv_cache_quant_mode)
+
+
+def _allocate_kv_cache_scale_buffers(
+    kv_caches: dict[str, torch.Tensor],
+    forward_context: dict[str, "Attention"],
+    kv_cache_quant_mode: str = "dynamic",
+) -> None:
+    """
+    For int8 KV cache layers with dynamic quantization mode, allocate
+    per-token per-head scale buffers and bind them to the attention layer
+    as `_kv_cache_scale`.
+
+    Scale buffer shape: (2, num_blocks, num_kv_heads, block_size)
+      - dim0: 0=K scale, 1=V scale
+      - dim1: block index
+      - dim2: kv head index
+      - dim3: token position within block
+
+    Memory overhead: 2 * num_blocks * num_kv_heads * block_size * 4 bytes
+    (approximately 4/head_size ≈ 3% of KV cache size for head_size=128)
+
+    When kv_cache_quant_mode == "static", no scale buffer is allocated;
+    static _k_scale/_v_scale from checkpoint are used instead.
+    """
+    for layer_name, kv_cache in kv_caches.items():
+        if layer_name not in forward_context:
+            continue
+        attn_layer = forward_context[layer_name]
+
+        # Only allocate for int8 KV cache
+        if not hasattr(attn_layer, 'kv_cache_dtype'):
+            continue
+        if attn_layer.kv_cache_dtype != "int8":
+            continue
+
+        # Only allocate scale buffer for dynamic quantization mode
+        if kv_cache_quant_mode != "dynamic":
+            logger.info(
+                f"Skipping scale buffer for {layer_name} "
+                f"(kv_cache_quant_mode={kv_cache_quant_mode})"
+            )
+            continue
+
+        # kv_cache shape: (2, num_blocks, num_kv_heads, block_size, head_size)
+        if kv_cache.dim() != 5:
+            continue
+
+        num_blocks = kv_cache.shape[1]
+        num_kv_heads = kv_cache.shape[2]
+        block_size = kv_cache.shape[3]
+
+        # Allocate scale buffer
+        scale_shape = (2, num_blocks, num_kv_heads, block_size)
+        kv_cache_scale = torch.zeros(
+            scale_shape, dtype=torch.float32, device=kv_cache.device
+        )
+        # logger.info(f"kunlun alloc per-token per-head scale buffer for {layer_name}")
+        attn_layer._kv_cache_scale = kv_cache_scale
 
 
 def is_residual_scattered_for_sp(

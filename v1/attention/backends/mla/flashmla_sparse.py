@@ -469,6 +469,7 @@ def quantize_mla_kv_cache_int8(
 def dequantize_mla_kv_cache_int8(
     kv_cache: torch.Tensor,
     group_size: int = 128,
+    active_block_ids: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     dim_nope = 512
     dim_rope = 64
@@ -477,9 +478,20 @@ def dequantize_mla_kv_cache_int8(
     assert kv_cache.shape[-1] == dim_packed
     assert dim_nope % group_size == 0
 
-    total_tokens = kv_cache.numel() // dim_packed
+    # kv_cache: (num_blocks, block_size, 656) or flat view
+    if active_block_ids is not None:
+        # Only dequant blocks that are actually used (eager mode optimization).
+        # Gather active blocks, dequant them, and return the flat bf16 cache
+        # with offsets shifted so that global token indices map correctly.
+        block_size = kv_cache.shape[1]
+        active_kv = kv_cache[active_block_ids]  # [n_active, block_size, 656]
+        total_tokens = active_kv.numel() // dim_packed
+    else:
+        active_kv = kv_cache
+        total_tokens = kv_cache.numel() // dim_packed
+
     num_tiles = dim_nope // group_size
-    packed = kv_cache.view(total_tokens, dim_packed)
+    packed = active_kv.view(total_tokens, dim_packed)
     nope_q = packed[:, :dim_nope].contiguous().view(total_tokens * num_tiles, group_size)
     nope_max = (
         packed[:, dim_nope : dim_nope + 16]

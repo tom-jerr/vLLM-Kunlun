@@ -44,6 +44,16 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 
 from vllm_kunlun.ops.paged_attn import PagedAttention, PagedAttentionMetadata
+from vllm_kunlun.ops.kv_quant import (
+    per_token_per_head_quant,
+    per_token_per_head_dequant,
+    reshape_and_cache_int8_with_scales,
+    read_scale_from_cache,
+    reconstruction_check,
+)
+
+import os
+_KV_RECON_CHECK = os.environ.get("VLLM_KUNLUN_KV_RECON_CHECK", "0") == "1"
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -107,6 +117,23 @@ class KunlunAttentionBackend(AttentionBackend):
         return PagedAttention.get_kv_cache_shape(
             num_blocks, block_size, num_kv_heads, head_size
         )
+
+    @staticmethod
+    def get_kv_cache_scale_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+    ) -> Tuple[int, ...]:
+        """Get shape for per-token per-head KV cache scale buffer.
+
+        Returns:
+            (2, num_blocks, num_kv_heads, block_size)
+            dim0: 0=K, 1=V
+            dim1: block index
+            dim2: kv head index
+            dim3: token position in block
+        """
+        return (2, num_blocks, num_kv_heads, block_size)
 
     @staticmethod
     def swap_blocks(
@@ -766,29 +793,26 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
         else:
             assert value is None
 
-        # int8 KV cache: use layer._k_scale / layer._v_scale as the fixed
-        # quantization/dequantization scale.
-        # If scale == 1.0 (uncalibrated default), compute dynamic per-head
-        # absmax from the current key/value batch.
+        # int8 KV cache quantization mode:
+        # - dynamic: per-token per-head dynamic quantization with _kv_cache_scale
+        #   buffer allocated in bind_kv_cache().
+        # - static: per-tensor static quantization using _k_scale/_v_scale from
+        #   checkpoint (default 1.0). No scale buffer allocated.
         is_int8_cache = self.kv_cache_dtype == "int8"
-        if is_int8_cache:
-            # use_dynamic_scale = (
-            #     layer._k_scale.item() == 1.0 and layer._v_scale.item() == 1.0
-            # )
-            # if use_dynamic_scale and key is not None and value is not None:
-            #     # Dynamic per-head absmax: compute from current tokens
-            #     # key shape: [num_tokens, num_kv_heads, head_size]
-            #     k_max_per_head = key.float().abs().amax(dim=(0, 2)).to(
-            #         torch.float32
-            #     )  # [num_kv_heads]
-            #     v_max_per_head = value.float().abs().amax(dim=(0, 2)).to(
-            #         torch.float32
-            #     )  # [num_kv_heads]
-            #     # Clamp to avoid division by zero
-            #     k_max_per_head = k_max_per_head.clamp(min=1e-5)
-            #     v_max_per_head = v_max_per_head.clamp(min=1e-5)
-            # else:
-            # Use calibrated static scale from checkpoint
+        use_per_token_quant = False
+
+        if is_int8_cache and kv_cache.numel() > 0:
+            if hasattr(layer, '_kv_cache_scale') and layer._kv_cache_scale is not None:
+                # Dynamic mode: scale buffer allocated by
+                # _allocate_kv_cache_scale_buffers()
+                use_per_token_quant = True
+            else:
+                # Static mode: use _k_scale/_v_scale from checkpoint
+                use_per_token_quant = False
+        logger.info_once(f"use_per_token_quant: {use_per_token_quant}")
+        if is_int8_cache and not use_per_token_quant:
+            # Static mode: per-tensor static scale from _k_scale/_v_scale
+            # (loaded from checkpoint or default 1.0)
             k_max_per_head = (
                 layer._k_scale
             ).expand(self.num_kv_heads).contiguous().to(torch.float32)
@@ -802,6 +826,15 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
             v_perchannel_scale = v_max_per_head.view(
                 self.num_kv_heads, 1).expand(
                 self.num_kv_heads, self.head_size).contiguous()
+        elif use_per_token_quant:
+            # Per-token per-head dynamic quantization:
+            # scales are stored per-token, no static per-head scale needed for write.
+            # For decode kernels that still need perchannel_scale, we set None
+            # and will do explicit dequant before calling the kernel.
+            k_max_per_head = None
+            v_max_per_head = None
+            k_perchannel_scale = None
+            v_perchannel_scale = None
         else:
             k_max_per_head = None
             v_max_per_head = None
@@ -830,7 +863,37 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                 # If kv_cache is not provided, the new key and value tensors are
                 # not cached. This happens during the initial memory
                 value = value.contiguous()
-                if is_int8_cache:
+                if use_per_token_quant:
+                    # Per-token per-head dynamic quantization path:
+                    # 1. Quantize key/value per-token per-head
+                    # 2. Write int8 data + scales into paged cache via torch native
+                    num_actual = attn_metadata.num_actual_tokens
+                    key_slice = key[:num_actual]
+                    val_slice = value[:num_actual]
+
+                    key_int8, k_scales = per_token_per_head_quant(key_slice)
+                    val_int8, v_scales = per_token_per_head_quant(val_slice)
+
+                    # Optional: reconstruction check before attention.
+                    # Enable with VLLM_KUNLUN_KV_RECON_CHECK=1.
+                    if _KV_RECON_CHECK:
+                        reconstruction_check(
+                            "K", key_slice, key_int8, k_scales, log_fn=logger.info
+                        )
+                        reconstruction_check(
+                            "V", val_slice, val_int8, v_scales, log_fn=logger.info
+                        )
+
+                    block_size = key_cache.shape[2]
+                    slot_map = updated_slot_mapping[:num_actual].to(torch.int32)
+
+                    reshape_and_cache_int8_with_scales(
+                        key_int8, val_int8, k_scales, v_scales,
+                        key_cache, value_cache, layer._kv_cache_scale,
+                        slot_map, block_size,
+                    )
+                    # logger.info("use per token quant")
+                elif is_int8_cache:
                     if not key_cache.is_contiguous():
                         # Hybrid Attention (e.g. Qwen3-Next): key_cache is
                         # non-contiguous due to as_strided_ interleaved k/v
@@ -883,9 +946,9 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                         BLHD_LAYOUT=False,
                     )
 
-            # For int8 cache, we defer dequantization to the specific paths that
-            # need it (prefill with prefix cache). Decode kernels (paged_attention,
-            # speculative_attention) handle int8 natively via k_perchannel_scale.
+            # For per-token int8 cache, decode dequantizes explicitly before
+            # calling kernels because current kernels do not support per-token
+            # per-head KV scales natively.
 
         assert attn_type == AttentionType.DECODER
         # Decoder self-attention supports chunked prefill.
@@ -929,14 +992,21 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                         context_kvlen_lod_xpu=prefill_meta.kv_lod_xpu,
                         alibi_slopes=self.alibi_slopes,
                         softmax_lse=None,
+                        swa_left=(
+                            self.sliding_window if self.sliding_window is not None else -1
+                        ),
+                        swa_right=0 if self.sliding_window is not None else -1,
+                        sink=(
+                            self.sinks.to(torch.float32) if self.sinks is not None else None
+                        ),
                     )
                 else:
                     # BF16: pass current chunk's k/v directly; kernel joins
                     # with cached KV via block_table internally.
                     kunlun_ops.prefill_attention(
                         q=prefill_query,
-                        k=prefill_key,
-                        v=prefill_value,
+                        k=key_cache,
+                        v=value_cache,
                         out=output[num_decode_tokens : attn_metadata.num_actual_tokens],
                         is_causal=True,
                         is_prefix_cache=True,
@@ -949,6 +1019,13 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                         context_kvlen_lod_xpu=prefill_meta.kv_lod_xpu,
                         alibi_slopes=self.alibi_slopes,
                         softmax_lse=None,
+                        swa_left=(
+                            self.sliding_window if self.sliding_window is not None else -1
+                        ),
+                        swa_right=0 if self.sliding_window is not None else -1,
+                        sink=(
+                            self.sinks.to(torch.float32) if self.sinks is not None else None
+                        ),
                     )
             else:
                 kunlun_ops.prefill_attention(
@@ -972,58 +1049,6 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     ),
                 )
 
-                # # DEBUG: compare bf16 prefill vs int8 cache prefill dequant correctness
-                # if is_int8_cache and key_cache is not None:
-                #     _out_bf16 = output[num_decode_tokens : attn_metadata.num_actual_tokens].clone()
-                #     _out_int8 = torch.zeros_like(_out_bf16)
-                #     # Build kvlen_lod same as qlen for non-prefix case
-                #     _kvlen_lod_cpu = prefill_meta.query_start_loc_host
-                #     _kvlen_lod_xpu = prefill_meta.query_start_loc
-
-                #     # Diagnose: check if cache actually has non-zero data
-                #     _kc_nonzero = (key_cache != 0).sum().item()
-                #     _vc_nonzero = (value_cache != 0).sum().item()
-                #     _kc_numel = key_cache.numel()
-                #     # Manual dequant check: first few values
-                #     _kc_slice = key_cache[0, 0, 0, :4].float()
-                #     _scale_val = k_max_per_head[0].item()
-                #     _kc_dequant_slice = _kc_slice * (_scale_val / 127.0)
-                #     _kc_dequant_127 = _kc_slice * 127.0
-                #     logger.info(
-                #         f"[DEBUG prefill cache diag] kc_nonzero={_kc_nonzero}/{_kc_numel}, "
-                #         f"vc_nonzero={_vc_nonzero}/{_kc_numel}, "
-                #         f"k_scale[0]={_scale_val:.4f}, "
-                #         f"kc_int8[:4]={key_cache[0,0,0,:4].tolist()}, "
-                #         f"kc_dequant[:4]={_kc_dequant_slice.tolist()}"
-                #         f"kc_dequant_no_scale[:4]={_kc_dequant_127.tolist()}"
-                #     )
-
-                    # kunlun_ops.prefill_attention(
-                    #     q=prefill_query,
-                    #     k=key_cache,
-                    #     v=value_cache,
-                    #     out=_out_int8,
-                    #     is_causal=True,
-                    #     is_prefix_cache=True,
-                    #     block_table=tmp_block_tables,
-                    #     context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
-                    #     context_qlen_lod_xpu=prefill_meta.query_start_loc,
-                    #     context_kvlen_lod_cpu=_kvlen_lod_cpu,
-                    #     context_kvlen_lod_xpu=_kvlen_lod_xpu,
-                    #     k_perchannel_scale=k_perchannel_scale,
-                    #     v_perchannel_scale=v_perchannel_scale,
-                    # )
-                    # _cos = torch.nn.functional.cosine_similarity(
-                    #     _out_bf16.float().reshape(-1).unsqueeze(0),
-                    #     _out_int8.float().reshape(-1).unsqueeze(0),
-                    # ).item()
-                    # _diff = (_out_bf16.float() - _out_int8.float()).abs()
-                    # logger.info(f"[DEBUG prefill int8 vs bf16] cos_sim={_cos:.6f}, "
-                    #       f"max_diff={_diff.max().item():.4f}, mean_diff={_diff.mean().item():.6f}")
-                    # logger.info(f"  bf16 out[:4]: {_out_bf16[0, 0, :4].tolist()}")
-                    # logger.info(f"  int8 out[:4]: {_out_int8[0, 0, :4].tolist()}")
-                
-
         if decode_meta := attn_metadata.decode_metadata:
             assert (
                 attn_type != AttentionType.ENCODER_ONLY
@@ -1038,16 +1063,67 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     decode_meta.block_tables * 2
                 )  # only test in Qwen3-Next
 
+            # Per-token per-head dynamic quantization decode path:
+            # Kernel doesn't support per-token scale, so we explicitly dequant
+            # the KV cache to bf16 before calling attention.
+            # TODO: Replace with a per-token-scale-aware decode kernel for perf.
+            if use_per_token_quant:
+                block_size = key_cache.shape[2]
+                num_physical_blocks = key_cache.shape[0]
+
+                # --- Full dequantization ---
+                # Dequantize ALL physical blocks to bf16, then use original
+                # block_tables (no remapping needed).
+                key_cache = key_cache.contiguous()
+                value_cache = value_cache.contiguous()
+
+                k_int8_flat = key_cache.permute(0, 2, 1, 3).reshape(
+                    num_physical_blocks * block_size,
+                    self.num_kv_heads, self.head_size,
+                )
+                v_int8_flat = value_cache.permute(0, 2, 1, 3).reshape(
+                    num_physical_blocks * block_size,
+                    self.num_kv_heads, self.head_size,
+                )
+                k_scales_flat = layer._kv_cache_scale[0].permute(0, 2, 1).reshape(
+                    num_physical_blocks * block_size, self.num_kv_heads,
+                )
+                v_scales_flat = layer._kv_cache_scale[1].permute(0, 2, 1).reshape(
+                    num_physical_blocks * block_size, self.num_kv_heads,
+                )
+
+                k_bf16_flat = per_token_per_head_dequant(
+                    k_int8_flat, k_scales_flat, out_dtype=query.dtype
+                )
+                v_bf16_flat = per_token_per_head_dequant(
+                    v_int8_flat, v_scales_flat, out_dtype=query.dtype
+                )
+
+                _key_cache = k_bf16_flat.reshape(
+                    num_physical_blocks, block_size,
+                    self.num_kv_heads, self.head_size,
+                ).permute(0, 2, 1, 3).contiguous()
+                _value_cache = v_bf16_flat.reshape(
+                    num_physical_blocks, block_size,
+                    self.num_kv_heads, self.head_size,
+                ).permute(0, 2, 1, 3).contiguous()
+
+                _k_perchannel_scale = None
+                _v_perchannel_scale = None
+            else:
+                _key_cache = key_cache
+                _value_cache = value_cache
+                _k_perchannel_scale = k_perchannel_scale
+                _v_perchannel_scale = v_perchannel_scale
+
             sig = inspect.signature(kunlun_ops.speculative_attention)
             if "max_window_size" in sig.parameters:
                 kunlun_ops.speculative_attention(
                     out=output[:num_decode_tokens],
                     # Only MLA support q len > 1 right now
                     q=decode_query.unsqueeze(0),
-                    k_cache=key_cache,
-                    v_cache=value_cache,
-                    k_perchannel_scale=k_perchannel_scale,
-                    v_perchannel_scale=v_perchannel_scale,
+                    k_cache=_key_cache,
+                    v_cache=_value_cache,
                     context_lens_cpu=decode_meta.seq_lens_tensor_cpu,
                     context_lens_xpu=decode_meta.seq_lens_tensor,
                     batch_num=decode_meta.block_tables.shape[0],
@@ -1059,7 +1135,7 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     head_dim=self.head_size,
                     scale=0.0,
                     kv_head_num=self.num_kv_heads,
-                    block_size=key_cache.shape[2],
+                    block_size=_key_cache.shape[2],
                     max_num_blocks_per_seq=decode_meta.block_tables.shape[1],
                     max_window_size=(
                         self.sliding_window if self.sliding_window is not None else -1
@@ -1072,10 +1148,8 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
             elif not attn_metadata.is_speculative:
                 kunlun_ops.paged_attention(
                     x=decode_query,
-                    k_cache=key_cache,
-                    v_cache=value_cache,
-                    k_perchannel_scale=k_perchannel_scale,
-                    v_perchannel_scale=v_perchannel_scale,
+                    k_cache=_key_cache,
+                    v_cache=_value_cache,
                     block_tables=tmp_block_tables,
                     context_lens_cpu=decode_meta.seq_lens_tensor_cpu,
                     context_lens_xpu=decode_meta.seq_lens_tensor,
@@ -1095,10 +1169,10 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                 kunlun_ops.speculative_attention(
                     out=out.view(batch_size, qlen, head_num, self.head_size),
                     q=decode_query.view(batch_size, qlen, head_num, head_dim),
-                    k_cache=key_cache,
-                    v_cache=value_cache,
-                    k_perchannel_scale=k_perchannel_scale,
-                    v_perchannel_scale=v_perchannel_scale,
+                    k_cache=_key_cache,
+                    v_cache=_value_cache,
+                    k_perchannel_scale=_k_perchannel_scale,
+                    v_perchannel_scale=_v_perchannel_scale,
                     context_lens_cpu=decode_meta.seq_lens_tensor_cpu,
                     context_lens_xpu=decode_meta.seq_lens_tensor,
                     batch_num=batch_size,
@@ -1108,12 +1182,11 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     head_dim=self.head_size,
                     scale=0.0,
                     kv_head_num=self.num_kv_heads,
-                    block_size=key_cache.shape[2],
+                    block_size=_key_cache.shape[2],
                     max_num_blocks_per_seq=decode_meta.block_tables.shape[1],
                     block_tables=tmp_block_tables
                 )
 
-            # logger.info(f"decode int8 out[:4]: {output[0, 0, :4].tolist()}")
 
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)

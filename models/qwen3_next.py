@@ -49,9 +49,9 @@ from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weigh
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,
-    MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
+from vllm_kunlun.ops.mamba.mamba_utils import MambaStateDtypeCalculator
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -268,7 +268,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
             self.model_config.dtype,
             self.cache_config.mamba_cache_dtype,
-            self.cache_config.mamba_ssm_cache_dtype,
         )
 
     def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
