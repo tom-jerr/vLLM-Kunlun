@@ -106,6 +106,21 @@ def _install_import_hook(logger: logging.Logger) -> None:
     _completed_steps.add("import_hook")
 
 
+def _patch_per_token_head_kv(logger: logging.Logger) -> None:
+    """Patch Attention.get_kv_cache_spec for inline per-(token,head) KV scales."""
+    if "per_token_head_kv" in _completed_steps:
+        return
+    try:
+        from .patches.patch_per_token_head_kv import apply_patch
+
+        apply_patch()
+        _completed_steps.add("per_token_head_kv")
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning(
+            "[KunlunPlugin] Failed to patch per-token-head KV spec: %s", e
+        )
+
+
 # =========================================================================
 # Public API
 # =========================================================================
@@ -130,6 +145,7 @@ def register():
     _load_native_extension(logger)
     _patch_schema_utils(logger)  # fatal: raises on failure
     _install_import_hook(logger)  # fatal: raises on failure
+    _patch_per_token_head_kv(logger)
 
     if first_call:
         logger.info("[KunlunPlugin] register() done")
@@ -138,6 +154,12 @@ def register():
 
 def register_model():
     """Register models for training and inference."""
+    # Apply patches that depend on a fully-initialised vllm package and
+    # therefore cannot run inside ``register()`` without hitting circular
+    # imports (e.g. ``vllm.config``). By the time vLLM calls
+    # ``register_model`` the core modules are already imported.
+    _patch_per_token_head_kv(_configure_kunlun_logger())
+
     from .models import register_model as _reg
 
     _reg()

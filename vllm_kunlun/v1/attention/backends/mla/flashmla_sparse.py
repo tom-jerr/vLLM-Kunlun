@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, ClassVar, Optional
 
 import numpy as np
 import torch
+import kunlun_ops
 from vllm.attention.backends.abstract import (
     AttentionBackend,
     AttentionLayer,
@@ -88,9 +89,8 @@ class FlashMLASparseBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
-        if cache_dtype_str == "fp8_ds_mla":
-            # custom storage fromat is 656 bytes
-            #  see FlashMLA readme.md for details
+        if cache_dtype_str in ("fp8_ds_mla", "int8"):
+            # Custom packed storage format is 656 bytes per token.
             return (num_blocks, block_size, 656)
         else:
             return (num_blocks, block_size, head_size)
@@ -423,6 +423,112 @@ def kunlun_concat_and_cache_mla(
     else:
         assert kv_cache.shape[2] == kv_lora_rank + pe_dim
         kunlun_mla()
+
+
+def quantize_mla_kv_cache_int8(
+    kv_c: torch.Tensor,
+    k_pe: torch.Tensor,
+    group_size: int = 128,
+) -> torch.Tensor:
+    dim_nope = 512
+    dim_rope = 64
+    dim_packed = 656
+    assert kv_c.shape[-1] == dim_nope
+    assert k_pe.shape[-1] == dim_rope
+    assert dim_nope % group_size == 0
+
+    num_tokens = kv_c.shape[0]
+    num_tiles = dim_nope // group_size
+    kv_c_grouped = kv_c.contiguous().view(num_tokens * num_tiles, group_size)
+    kv_c_int8 = torch.empty_like(kv_c_grouped, dtype=torch.int8)
+    kv_c_max = torch.empty(
+        (num_tokens * num_tiles,), dtype=torch.float32, device=kv_c.device
+    )
+    torch.ops._C.quant2d(kv_c_grouped, kv_c_int8, kv_c_max, force_sdnn=True)
+
+    packed = torch.empty(
+        (num_tokens, dim_packed), dtype=torch.int8, device=kv_c.device
+    )
+    packed[:, :dim_nope].copy_(kv_c_int8.view(num_tokens, dim_nope))
+    packed[:, dim_nope : dim_nope + 16].copy_(
+        kv_c_max.view(num_tokens, num_tiles)
+        .contiguous()
+        .view(torch.int8)
+        .view(num_tokens, 16)
+    )
+    packed[:, dim_nope + 16 :].copy_(
+        k_pe.contiguous()
+        .to(torch.bfloat16)
+        .view(num_tokens, dim_rope)
+        .view(torch.int8)
+        .view(num_tokens, 128)
+    )
+    return packed
+
+
+def dequantize_mla_kv_cache_int8(
+    kv_cache: torch.Tensor,
+    group_size: int = 128,
+    active_block_ids: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    dim_nope = 512
+    dim_rope = 64
+    dim_packed = 656
+    assert kv_cache.dtype == torch.int8
+    assert kv_cache.shape[-1] == dim_packed
+    assert dim_nope % group_size == 0
+
+    # kv_cache: (num_blocks, block_size, 656) or flat view
+    if active_block_ids is not None:
+        # Only dequant blocks that are actually used (eager mode optimization).
+        # Gather active blocks, dequant them, and return the flat bf16 cache
+        # with offsets shifted so that global token indices map correctly.
+        block_size = kv_cache.shape[1]
+        active_kv = kv_cache[active_block_ids]  # [n_active, block_size, 656]
+        total_tokens = active_kv.numel() // dim_packed
+    else:
+        active_kv = kv_cache
+        total_tokens = kv_cache.numel() // dim_packed
+
+    num_tiles = dim_nope // group_size
+    packed = active_kv.view(total_tokens, dim_packed)
+    nope_q = packed[:, :dim_nope].contiguous().view(total_tokens * num_tiles, group_size)
+    nope_max = (
+        packed[:, dim_nope : dim_nope + 16]
+        .contiguous()
+        .view(torch.float32)
+        .view(total_tokens * num_tiles)
+    )
+    rope = (
+        packed[:, dim_nope + 16 :]
+        .contiguous()
+        .view(torch.bfloat16)
+        .view(total_tokens, dim_rope)
+    )
+
+    nope = torch.empty(
+        (total_tokens * num_tiles, group_size),
+        dtype=torch.bfloat16,
+        device=kv_cache.device,
+    )
+    kunlun_ops.dequant2d_per_token(nope_q, nope_max, nope, is_absmax=True)
+    return torch.cat([nope.view(total_tokens, dim_nope), rope], dim=-1)
+
+
+def concat_and_cache_mla_int8(
+    kv_c: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    block_size = kv_cache.shape[1]
+    valid_mask = slot_mapping >= 0
+    if not valid_mask.any():
+        return
+
+    slots = slot_mapping[valid_mask].to(torch.long)
+    packed = quantize_mla_kv_cache_int8(kv_c[valid_mask], k_pe[valid_mask])
+    kv_cache[slots // block_size, slots % block_size, :].copy_(packed)
 
 
 @dataclass
@@ -794,7 +900,19 @@ class FlashMLASparseImpl(MLACommonBaseImpl[FlashMLASparseMetadata]):
 
         q = torch.cat([ql_nope, q_pe], dim=-1)
 
-        if self.kv_cache_dtype != "fp8_ds_mla":
+        if self.kv_cache_dtype == "int8":
+            if kv_cache.numel() > 0:
+                torch.ops._C.concat_and_cache_mla(
+                    kv_c=k_c_normed,
+                    k_pe=k_pe.squeeze(1),
+                    kv_cache=kv_cache,
+                    slot_mapping=attn_metadata.slot_mapping.flatten(),
+                )
+            kv_cache_bf16 = dequantize_mla_kv_cache_int8(kv_cache)
+            attn_out = self._forward_bf16_kv(
+                q, kv_cache_bf16, topk_indices, attn_metadata
+            )
+        elif self.kv_cache_dtype != "fp8_ds_mla":
             # write the latent and rope to kv cache
             if kv_cache.numel() > 0:
                 torch.ops._C.concat_and_cache_mla(
@@ -807,7 +925,7 @@ class FlashMLASparseImpl(MLACommonBaseImpl[FlashMLASparseMetadata]):
         else:
             # attn_out = self._forward_fp8_kv(q, kv_cache, topk_indices_global,
             #                                 attn_metadata)
-            raise NotImplementedError("Only support --kv-cache-dtype bfloat16")
+            raise NotImplementedError("Only support --kv-cache-dtype bfloat16 or int8")
 
         self._v_up_proj(attn_out, out=output[:num_actual_toks])
         return output

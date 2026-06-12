@@ -14,8 +14,8 @@
 # limitations under the License.
 # This file is a part of the vllm-kunlun project.
 #
-import copy
 from dataclasses import dataclass
+from itertools import accumulate
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -32,6 +32,8 @@ import kunlun_ops
 import numpy as np
 import torch
 from vllm.config import VllmConfig
+from vllm.platforms import current_platform
+from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -44,19 +46,75 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 
 from vllm_kunlun.ops.paged_attn import PagedAttention, PagedAttentionMetadata
+from vllm_kunlun.quantization.kv_cache.per_token_head import (
+    reshape_and_cache_int8_with_scales,
+    reconstruction_check,
+)
+
+import os
+_KV_RECON_CHECK = os.environ.get("VLLM_KUNLUN_KV_RECON_CHECK", "0") == "1"
+_KV_SHAPE_LOG = os.environ.get("VLLM_KUNLUN_KV_SHAPE_LOG", "0") == "1"
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.worker.gpu_input_batch import InputBatch
 
+import inspect
 
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
 from vllm.v1.kv_cache_interface import AttentionSpec
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Cache dtypes that use inline per-(token, head) float32 scale stored in the
+# trailing ``scale_pad`` elements of each KV-cache head row. See
+# ``docs/per_token_plan.md`` for the storage layout.
+_PER_TOKEN_HEAD_SCALE_DTYPES = frozenset({
+    "int8_per_token_head",
+    "fp8_per_token_head",
+})
+
+
+def kv_cache_uses_per_token_head_scales(cache_dtype_str: str) -> bool:
+    """Return True iff ``cache_dtype_str`` uses inline per-token-head scales.
+
+    The bool is also true for unsupported dtypes that aren't in
+    ``STR_DTYPE_TO_TORCH_DTYPE`` (e.g. legacy names). Callers that need to
+    compute ``scale_pad`` should resolve the torch dtype first; this helper
+    only gates storage-shape decisions.
+    """
+    if cache_dtype_str in _PER_TOKEN_HEAD_SCALE_DTYPES:
+        return True
+    if cache_dtype_str not in STR_DTYPE_TO_TORCH_DTYPE:
+        return False
+    cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype_str]
+    if cache_dtype == torch.int8 and "per_token_head" in cache_dtype_str:
+        return True
+    return False
+
+
+def _per_token_head_scale_pad(cache_dtype: torch.dtype) -> int:
+    """Number of int8/fp8 elements that pad each head row to hold one float32.
+
+    Mirrors the doc's invariant:
+        scale_pad = sizeof(float32) / sizeof(cache_dtype)
+    """
+    float32_bytes = torch.empty((), dtype=torch.float32).element_size()
+    return float32_bytes // torch.empty((), dtype=cache_dtype).element_size()
 
 
 class KunlunAttentionBackend(AttentionBackend):
     """KunlunAttentionBackend"""
+
+    supported_kv_cache_dtypes: ClassVar[list] = [
+        "auto",
+        "float16",
+        "bfloat16",
+        "int8",
+        "int8_per_token_head",
+    ]
 
     # crucial to cuda graph
     accept_output_buffer = True
@@ -100,11 +158,43 @@ class KunlunAttentionBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> Tuple[int, ...]:
-        """get_kv_cache_shape"""
-        # return (2, num_blocks, block_size, num_kv_heads * head_size)
-        return PagedAttention.get_kv_cache_shape(
-            num_blocks, block_size, num_kv_heads, head_size
-        )
+        """get_kv_cache_shape
+
+        For ``int8_per_token_head`` (and the analogous ``fp8_per_token_head``),
+        the last dim is padded by ``scale_pad = sizeof(float32) / sizeof(cache_dtype)``
+        int8/fp8 elements, so the trailing bytes of each head row can be
+        reinterpreted as a single float32 per-(token, head) scale. This matches
+        the inline-scale layout used by vLLM's Triton attention backend (see
+        ``docs/per_token_plan.md``). For all other dtypes the layout is unchanged.
+        """
+        if current_platform.is_kunlun():
+            base = (2, num_blocks, num_kv_heads, block_size, head_size)
+        else:
+            base = (2, num_blocks, block_size * num_kv_heads * head_size)
+        if kv_cache_uses_per_token_head_scales(cache_dtype_str):
+            cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype_str]
+            logger.info(f"int8_per_token_head shape: {base[:-1] + (base[-1] + _per_token_head_scale_pad(cache_dtype),)}")
+            return base[:-1] + (base[-1] + _per_token_head_scale_pad(cache_dtype),)
+        return base
+
+    @staticmethod
+    def get_kv_cache_scale_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+    ) -> Tuple[int, ...]:
+        """Shape of the per-(token, head) float32 scale view extracted from the
+        inline padding of the KV cache.
+
+        Aligned with the doc's ``k_scale_cache`` / ``v_scale_cache`` views:
+            (num_blocks, block_size, num_kv_heads)
+        Note: the scale is now an *inline* view of the KV-cache storage
+        (returned by ``KunlunAttentionImpl._ensure_scale_caches``), not a
+        separately-allocated buffer. This method only describes the view
+        shape for callers that want to size pre-allocated buffers or for
+        tests/diagnostics.
+        """
+        return (num_blocks, block_size, num_kv_heads)
 
     @staticmethod
     def swap_blocks(
@@ -602,6 +692,13 @@ class KunlunAttentionMetadataBuilder:
         seq_lens = common_attn_metadata.seq_lens
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu
 
+        seq_start_loc = list(accumulate(seq_lens, initial=0))
+
+        seq_start_loc_tensor = torch.empty(
+            len(seq_start_loc), dtype=torch.int32, device=self.device
+        )
+        seq_start_loc_tensor.copy_(torch.as_tensor(seq_start_loc, dtype=torch.int32))
+
         kv_lod_cpu = torch.zeros(num_reqs + 1, dtype=torch.int32, device="cpu")
         kv_lod_cpu[1:] = seq_lens_cpu.to(torch.int32).cumsum(dim=0)
         kv_lod_xpu = kv_lod_cpu.to(self.device)
@@ -660,18 +757,6 @@ class KunlunAttentionMetadataBuilder:
             max_model_len=self.vllm_config.model_config.max_model_len,
         )
         return attn_metadata
-
-    def update_block_table(
-        self,
-        metadata: KunlunMetadata,
-        blk_table: torch.Tensor,
-        slot_mapping: torch.Tensor,
-    ) -> KunlunMetadata:
-        """Update block table and slot mapping for a different KV cache group."""
-        new_metadata = copy.copy(metadata)
-        new_metadata.block_tables = blk_table
-        new_metadata.slot_mapping = slot_mapping
-        return new_metadata
 
     def can_run_in_cudagraph(
         self, common_attn_metadata: CommonAttentionMetadata
@@ -740,6 +825,233 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
             )
         self.multi_modal_placeholder_index_maps = multi_modal_placeholder_index_maps
 
+        # Per-token per-head scale views carved from the inline head padding
+        # of the KV cache. Populated lazily on the first forward when
+        # ``self.kv_cache_dtype == "int8_per_token_head"`` (see
+        # ``_ensure_scale_caches``). Shape: ``(num_blocks, block_size,
+        # num_kv_heads)``, dtype=float32, sharing storage with the kv_cache.
+        self._k_scale_cache: Optional[torch.Tensor] = None
+        self._v_scale_cache: Optional[torch.Tensor] = None
+        # Logical head size (without the per-token-head scale padding) used by
+        # the cache-write path to know where the data region ends inside the
+        # padded last dim.
+        self._orin_head_size: int = head_size
+
+    # Per-token-head quant: strided float32 views over the trailing
+    # ``scale_pad`` int8 elements of each KV-cache head row.
+    def _ensure_scale_caches(self, kv_cache: torch.Tensor) -> None:
+        """Create inline scale views for per-token-head quantization.
+
+        The KV cache for ``int8_per_token_head`` has shape
+        ``(2, num_blocks, num_kv_heads, block_size, head_size + scale_pad)``
+        in int8. The trailing ``scale_pad`` int8 elements of each head row are
+        reinterpreted as one float32 per-(token, head) scale. This method
+        builds two float32 tensors of shape ``(num_blocks, block_size,
+        num_kv_heads)`` that share storage with the KV cache, mirroring
+        vLLM Triton attention's ``_ensure_scale_caches`` (see
+        ``docs/per_token_plan.md``).
+
+        Idempotent: subsequent calls with the same kv_cache are no-ops; calls
+        with a different kv_cache (rare; e.g. after a remap) rebuild the
+        views.
+        """
+        if self._k_scale_cache is not None and self._v_scale_cache is not None:
+            # Already built for this layer; preserve cache so dequant reads
+            # remain stable across forward calls.
+            return
+        # kv_cache: (2, num_blocks, num_kv_heads, block_size, head_size+scale_pad)
+        num_blocks = kv_cache.shape[1]
+        num_kv_heads = kv_cache.shape[2]
+        block_size = kv_cache.shape[3]
+        head_size_with_pad = kv_cache.shape[4]
+        cache_dtype = kv_cache.dtype
+        scale_pad = _per_token_head_scale_pad(cache_dtype)
+        head_size = head_size_with_pad - scale_pad
+        # Cache the logical head size so the write path can slice the data
+        # region off the padded last dim.
+        self._orin_head_size = head_size
+
+        # Byte strides per (block, head, slot) in int8 element units.
+        block_bytes = num_kv_heads * block_size * head_size_with_pad
+        head_bytes = block_size * head_size_with_pad
+        slot_bytes = head_size_with_pad
+        # In float32 element units (4 bytes each): scale_pad=4 ensures
+        # (head_size+scale_pad) is a multiple of 4 for all supported head
+        # sizes, so these integer divisions are exact.
+        block_f32 = block_bytes // 4
+        head_f32 = head_bytes // 4
+        slot_f32 = slot_bytes // 4
+        scale_off_f32 = (head_size * torch.empty((), dtype=cache_dtype).element_size()) // 4
+
+        # Build a float32 view over the raw storage of the kv_cache tensor.
+        # `untyped_storage()` returns the underlying byte buffer; we wrap it
+        # as a 0-element float32 tensor and then use `as_strided` to carve
+        # out the scale region. This is identical to the approach used in
+        # vLLM's Triton attention backend.
+        raw = kv_cache.untyped_storage()
+        base_f32 = torch.tensor(
+            [], dtype=torch.float32, device=kv_cache.device,
+        ).set_(raw)
+
+        # K scales live in the kv_half=0 plane of the storage; their byte
+        # offset within a head row is `head_size * elem_size`.
+        self._k_scale_cache = torch.as_strided(
+            base_f32,
+            size=(num_blocks, block_size, num_kv_heads),
+            stride=(block_f32, slot_f32, head_f32),
+            storage_offset=scale_off_f32,
+        )
+        # V scales live in the kv_half=1 plane, one full K/V plane
+        # (= `block_bytes` bytes) further into the storage.
+        kv_half_bytes = num_blocks * num_kv_heads * block_size * head_size_with_pad
+        v_base_f32 = kv_half_bytes // 4
+        self._v_scale_cache = torch.as_strided(
+            base_f32,
+            size=(num_blocks, block_size, num_kv_heads),
+            stride=(block_f32, slot_f32, head_f32),
+            storage_offset=v_base_f32 + scale_off_f32,
+        )
+
+    # @nvtx.annotate("batch_prefill_merge", color="red")
+    def _decode_via_prefill_merge(
+        self,
+        out: torch.Tensor,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        block_tables: torch.Tensor,
+        context_lens_cpu: torch.Tensor,
+        k_perblock_perhead_scale: Optional[torch.Tensor] = None,
+        v_perblock_perhead_scale: Optional[torch.Tensor] = None,
+        k_static_perchannel_scale: Optional[torch.Tensor] = None,
+        v_static_perchannel_scale: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Unified decode path: per-block (block_size=1) prefill_attention +
+        LSE merge.
+
+        Replaces both speculative_attention and paged_attention with a
+        block-by-block evaluation. Each cached token is treated as a 1-token
+        "prefill block"; partial outputs are combined via
+        attention_merge_stage. Supports:
+          - bf16/fp16 cache (no scales)
+          - int8 static (k/v_static_perchannel_scale broadcast to all blocks)
+          - int8 dynamic per-token per-head (k/v_perblock_perhead_scale)
+
+        Shapes (block_size = 1):
+            out:                       [batch, qlen, head_num, head_dim]
+            q:                         [batch, qlen, head_num, head_dim]
+            k/v_cache:                 [num_blocks, kv_heads, 1, head_dim]
+            block_tables:              [batch, max_blocks_per_seq]
+            context_lens_cpu:          [batch] int32
+            k/v_perblock_perhead_scale:[num_blocks, kv_heads] or None
+            k/v_static_perchannel_scale:[kv_heads, head_dim] or None
+        """
+        batch_size, qlen, head_num, head_dim = q.shape
+        device = q.device
+        dtype = q.dtype
+
+        q_lod_cpu = torch.tensor([0, qlen], dtype=torch.int32)
+        q_lod_xpu = q_lod_cpu.to(device)
+        kv_lod_cpu = torch.tensor([0, 1], dtype=torch.int32)
+        kv_lod_xpu = kv_lod_cpu.to(device)
+
+        
+        for batch_idx in range(batch_size):
+            ctx_len = int(context_lens_cpu[batch_idx].item())
+            if ctx_len <= 0:
+                continue
+            q_tokens = q[batch_idx]  # [qlen, H, D]
+
+            # During warm-up / dummy runs the contents of `block_tables` are
+            # uninitialized memory (kernels that consume it on-device clamp
+            # internally, but our python-side .item() does not). Clamp
+            # defensively against the cache's first-dim length.
+            num_total_blocks = k_cache.shape[0]
+            max_block_idx = num_total_blocks - 1
+
+            acc_out = None
+            acc_lse = None
+            for logical_idx in range(ctx_len):
+                raw_block = int(
+                    block_tables[batch_idx, logical_idx].item()
+                )
+                if raw_block < 0 or raw_block > max_block_idx:
+                    physical_block = 0
+                else:
+                    physical_block = raw_block
+                
+                # with nvtx.annotate("kv_scale_calc", color="green"):
+                if k_perblock_perhead_scale is not None:
+                    k_scale = (
+                        k_perblock_perhead_scale[physical_block]
+                        .view(-1, 1)
+                        .expand(-1, head_dim)
+                        .contiguous()
+                    )
+                    v_scale = (
+                        v_perblock_perhead_scale[physical_block]
+                        .view(-1, 1)
+                        .expand(-1, head_dim)
+                        .contiguous()
+                    )
+                else:
+                    k_scale = k_static_perchannel_scale
+                    v_scale = v_static_perchannel_scale
+                # with nvtx.annotate("init_var", color="blue"):
+                bt = torch.tensor(
+                    [[physical_block]], dtype=torch.int32, device=device
+                )
+                chunk_out = torch.zeros(
+                    qlen, head_num, head_dim, dtype=dtype, device=device
+                )
+                # prefill_attention_lse with fp16 q requires fp16 lse via
+                # use_xfa_boost=True; bf16/fp32 q can use fp32 lse directly.
+                use_xfa_boost = (dtype == torch.float16)
+                lse_dtype = torch.float16 if use_xfa_boost else torch.float32
+                chunk_lse = torch.empty(
+                    head_num, qlen, dtype=lse_dtype, device=device
+                )
+                # with nvtx.annotate("prefill_attention", color="yellow"):
+                kunlun_ops.prefill_attention(
+                    q=q_tokens,
+                    k=k_cache,
+                    v=v_cache,
+                    out=chunk_out,
+                    is_causal=False,
+                    is_prefix_cache=True,
+                    block_table=bt,
+                    context_qlen_lod_cpu=q_lod_cpu,
+                    context_qlen_lod_xpu=q_lod_xpu,
+                    context_kvlen_lod_cpu=kv_lod_cpu,
+                    context_kvlen_lod_xpu=kv_lod_xpu,
+                    k_perchannel_scale=k_scale,
+                    v_perchannel_scale=v_scale,
+                    softmax_lse=chunk_lse,
+                    unpadded_lse=True,
+                    use_xfa_boost=use_xfa_boost,
+                )
+                
+                # with nvtx.annotate("attention_merge_state", color="purple"):
+                # attention_merge_stage expects float32 LSE.
+                chunk_lse_t = chunk_lse.transpose(0, 1).contiguous().to(
+                    torch.float32
+                )
+
+                if acc_out is None:
+                    acc_out = chunk_out
+                    acc_lse = chunk_lse_t
+                    continue
+                next_out = torch.empty_like(acc_out)
+                next_lse = torch.empty_like(acc_lse)
+                kunlun_ops.attention_merge_stage(
+                    acc_out, acc_lse, chunk_out, chunk_lse_t,
+                    next_out, next_lse,
+                )
+                acc_out = next_out
+                acc_lse = next_lse
+
+            out[batch_idx].copy_(acc_out)
+
     def forward(
         self,
         layer: AttentionLayer,
@@ -769,6 +1081,48 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
         else:
             assert value is None
 
+        # int8 KV cache quantization modes:
+        # - int8: per-tensor static quantization using _k_scale/_v_scale from
+        #   checkpoint (default 1.0). No scale buffer allocated.
+        # - int8_per_token_head: per-token per-head dynamic quantization with
+        #   scales stored *inline* in the trailing ``scale_pad`` int8 elements
+        #   of each KV-cache head row (see ``_ensure_scale_caches`` and
+        #   ``docs/per_token_plan.md``). The last dim of the kv_cache tensor is
+        #   ``head_size + scale_pad``.
+        is_int8_cache = self.kv_cache_dtype in ("int8", "int8_per_token_head")
+        use_per_token_quant = self.kv_cache_dtype == "int8_per_token_head"
+        logger.info_once(f"use_per_token_quant: {use_per_token_quant}")
+        if is_int8_cache and not use_per_token_quant:
+            # Static mode: per-tensor static scale from _k_scale/_v_scale
+            # (loaded from checkpoint or default 1.0)
+            k_max_per_head = (
+                layer._k_scale
+            ).expand(self.num_kv_heads).contiguous().to(torch.float32)
+            v_max_per_head = (
+                layer._v_scale
+            ).expand(self.num_kv_heads).contiguous().to(torch.float32)
+
+            k_perchannel_scale = k_max_per_head.view(
+                self.num_kv_heads, 1).expand(
+                self.num_kv_heads, self.head_size).contiguous()
+            v_perchannel_scale = v_max_per_head.view(
+                self.num_kv_heads, 1).expand(
+                self.num_kv_heads, self.head_size).contiguous()
+        elif use_per_token_quant:
+            # Per-token per-head dynamic quantization:
+            # scales are stored per-token, no static per-head scale needed for write.
+            # For decode kernels that still need perchannel_scale, we set None
+            # and will do explicit dequant before calling the kernel.
+            k_max_per_head = None
+            v_max_per_head = None
+            k_perchannel_scale = None
+            v_perchannel_scale = None
+        else:
+            k_max_per_head = None
+            v_max_per_head = None
+            k_perchannel_scale = None
+            v_perchannel_scale = None
+
         # Self-attention vs. cross-attention will impact
         # which KV cache memory-mapping & which
         # seqlen datastructures we utilize
@@ -780,20 +1134,130 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
             # Even if there are no new key/value pairs to cache,
             # we still need to break out key_cache and value_cache
             # i.e. for later use by paged attention
-            key_cache, value_cache = PagedAttention.split_kv_cache(kv_cache=kv_cache)
+            key_cache, value_cache = PagedAttention.split_kv_cache(
+                kv_cache, self.num_kv_heads, self.head_size
+            )
 
             if (key is not None) and (value is not None):
                 updated_slot_mapping = attn_metadata.slot_mapping
 
-                # Skip cache write for KV sharing layers: their cache is
-                # the target layer's cache and already contains correct values.
-                if self.kv_sharing_target_layer_name is None:
-                    # Reshape the input keys and values and store them in
-                    # the cache. If kv_cache is not provided, the new key
-                    # and value tensors are not cached. This happens during
-                    # the initial memory
-                    value = value.contiguous()
-                    key = key.contiguous()
+                # Reshape the input keys and values and store them in the cache.
+                # If kv_cache is not provided, the new key and value tensors are
+                # not cached. This happens during the initial memory
+                value = value.contiguous()
+                if use_per_token_quant:
+                    # Per-token per-head dynamic quantization path. Aligned
+                    # with vLLM Triton attention's
+                    # triton_reshape_and_cache_flash_per_token_head_quant:
+                    #
+                    # 1. Lazily carve float32 scale views from the inline
+                    #    head padding of the kv_cache (no separate scale
+                    #    buffer is allocated anywhere).
+                    # 2. Quantize K/V per (token, head), write int8 data into
+                    #    the *data* region of the cache (head_size int8 elems)
+                    #    and the float32 absmax scale into the *padding*
+                    #    region of the cache (scale_pad bytes re-interpreted
+                    #    as one float32). All three writes share the same
+                    #    storage, so cache block copy/swap automatically
+                    #    carries both data and scales.
+                    self._ensure_scale_caches(kv_cache)
+
+                    num_actual = attn_metadata.num_actual_tokens
+                    key_slice = key[:num_actual]
+                    val_slice = value[:num_actual]
+
+                    # Optional: reconstruction check before attention.
+                    # Enable with VLLM_KUNLUN_KV_RECON_CHECK=1. We run an
+                    # *in-tensor* quant to keep the rest of the path free of
+                    # extra allocations.
+                    if _KV_RECON_CHECK:
+                        from vllm_kunlun.quantization.kv_cache.per_token_head import (
+                            per_token_per_head_quant,
+                        )
+                        key_int8_chk, k_scales_chk = per_token_per_head_quant(
+                            key_slice,
+                        )
+                        val_int8_chk, v_scales_chk = per_token_per_head_quant(
+                            val_slice,
+                        )
+                        reconstruction_check(
+                            "K", key_slice, key_int8_chk, k_scales_chk,
+                            log_fn=logger.info,
+                        )
+                        reconstruction_check(
+                            "V", val_slice, val_int8_chk, v_scales_chk,
+                            log_fn=logger.info,
+                        )
+
+                    block_size = key_cache.shape[2]
+                    slot_map = updated_slot_mapping[:num_actual].to(torch.int32)
+                    if _KV_SHAPE_LOG:
+                        logger.info(
+                            "[KV cache write shapes] key=%s value=%s "
+                            "key_cache=%s value_cache=%s "
+                            "k_scale_cache=%s v_scale_cache=%s slot_mapping=%s",
+                            tuple(key_slice.shape),
+                            tuple(val_slice.shape),
+                            tuple(key_cache.shape),
+                            tuple(value_cache.shape),
+                            tuple(self._k_scale_cache.shape),
+                            tuple(self._v_scale_cache.shape),
+                            tuple(slot_map.shape),
+                        )
+
+                    # The single fused write: quant + scatter int8 into the
+                    # data region of each head row + scatter float32 scale
+                    # into the inline padding (via the strided view).
+                    reshape_and_cache_int8_with_scales(
+                        key_slice, val_slice,
+                        key_cache, value_cache,
+                        self._k_scale_cache, self._v_scale_cache,
+                        slot_map, block_size, self._orin_head_size,
+                    )
+                elif is_int8_cache:
+                    if not key_cache.is_contiguous():
+                        # Hybrid Attention (e.g. Qwen3-Next): key_cache is
+                        # non-contiguous due to as_strided_ interleaved k/v
+                        # layout. reshape_and_cache kernel computes write offset
+                        # as slot * head_size assuming contiguous block stride,
+                        # but actual stride[0] = 2 * block_size * head_size.
+                        # Fix: remap slot_mapping so kernel writes to the
+                        # correct physical address. Zero extra memory needed.
+                        block_size = key_cache.shape[2]
+                        stride_factor = (
+                            key_cache.stride()[0]
+                            // (self.num_kv_heads * block_size * self.head_size)
+                        )
+                        _slots = updated_slot_mapping[
+                            : attn_metadata.num_actual_tokens]
+                        _block_ids = _slots.long() // block_size
+                        _offsets = _slots.long() % block_size
+                        _adjusted_slots = (
+                            _block_ids * stride_factor * block_size + _offsets
+                        ).to(torch.int32)
+
+                        kunlun_ops.reshape_and_cache(
+                            key[: attn_metadata.num_actual_tokens],
+                            value[: attn_metadata.num_actual_tokens],
+                            key_cache,
+                            value_cache,
+                            _adjusted_slots,
+                            k_max=k_max_per_head,
+                            v_max=v_max_per_head,
+                            quant_mode=0,
+                        )
+                    else:
+                        kunlun_ops.reshape_and_cache(
+                            key[: attn_metadata.num_actual_tokens],
+                            value[: attn_metadata.num_actual_tokens],
+                            key_cache,
+                            value_cache,
+                            updated_slot_mapping.to(torch.int32),
+                            k_max=k_max_per_head,
+                            v_max=v_max_per_head,
+                            quant_mode=0,
+                        )
+                else:
                     kunlun_ops.reshape_and_cache_flash(
                         key[: attn_metadata.num_actual_tokens],
                         value[: attn_metadata.num_actual_tokens],
@@ -802,6 +1266,10 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                         updated_slot_mapping,
                         BLHD_LAYOUT=False,
                     )
+
+            # For per-token int8 cache, decode dequantizes explicitly before
+            # calling kernels because current kernels do not support per-token
+            # per-head KV scales natively.
 
         assert attn_type == AttentionType.DECODER
         # Decoder self-attention supports chunked prefill.
@@ -815,16 +1283,6 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
             prefill_key = key[num_decode_tokens : attn_metadata.num_actual_tokens]
             prefill_value = value[num_decode_tokens : attn_metadata.num_actual_tokens]
 
-            # NOTE(kunlun): prefill_attention kernel internally applies
-            # 1/sqrt(head_dim) and multiplies by alpha. Compute alpha to
-            # achieve the desired effective scaling:
-            #   score = Q @ K^T * (1/sqrt(d)) * alpha
-            # We want: score = Q @ K^T * self.scale
-            # So: alpha = self.scale * sqrt(d) = self.scale / (1/sqrt(d))
-            import math
-
-            _prefill_alpha = self.scale * math.sqrt(self.head_size)
-
             # For hybrid Attention (Qwen3-Next.)
             if key_cache.is_contiguous():
                 tmp_block_tables = prefill_meta.block_tables
@@ -832,43 +1290,74 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                 # For hybrid Attention (Qwen3-Next)
                 tmp_block_tables = prefill_meta.block_tables * 2
 
-            # Prefix cache or KV sharing layers (must read K/V from cache)
-            is_kv_sharing = self.kv_sharing_target_layer_name is not None
-            if (
-                is_kv_sharing
-                or prefill_meta.query_start_loc_host[-1] != prefill_meta.kv_lod_cpu[-1]
-            ):
-                kunlun_ops.prefill_attention(
-                    q=prefill_query,
-                    k=key_cache,  # Key Cache [block_num, head, block_size, dim]
-                    v=value_cache,
-                    out=output[num_decode_tokens : attn_metadata.num_actual_tokens],
-                    is_causal=True,
-                    is_prefix_cache=True,
-                    alpha=_prefill_alpha,
-                    block_table=tmp_block_tables,
-                    context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
-                    context_qlen_lod_xpu=prefill_meta.query_start_loc,
-                    context_kvlen_lod_cpu=prefill_meta.kv_lod_cpu,
-                    context_kvlen_lod_xpu=prefill_meta.kv_lod_xpu,
-                    alibi_slopes=self.alibi_slopes,
-                    softmax_lse=None,
-                    swa_left=(
-                        self.sliding_window if self.sliding_window is not None else -1
-                    ),
-                    swa_right=0 if self.sliding_window is not None else -1,
-                    sink=(
-                        self.sinks.to(torch.float32) if self.sinks is not None else None
-                    ),
-                )
+            # Prefix cache (chunked prefill with cached KV tokens)
+            if prefill_meta.query_start_loc_host[-1] != prefill_meta.kv_lod_cpu[-1]:
+                if is_int8_cache:
+                    # INT8 KV cache: kernel expects k/v to be paged int8 cache
+                    # tensors with shape (block_num, kv_heads, block_size, head_dim).
+                    # All KV (cached + new) has been written to cache by
+                    # reshape_and_cache above; kernel reads via block_table.
+                    kunlun_ops.prefill_attention(
+                        q=prefill_query,
+                        k=key_cache,
+                        v=value_cache,
+                        out=output[num_decode_tokens : attn_metadata.num_actual_tokens],
+                        is_causal=True,
+                        is_prefix_cache=True,
+                        k_perchannel_scale=k_perchannel_scale,
+                        v_perchannel_scale=v_perchannel_scale,
+                        block_table=tmp_block_tables,
+                        context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
+                        context_qlen_lod_xpu=prefill_meta.query_start_loc,
+                        context_kvlen_lod_cpu=prefill_meta.kv_lod_cpu,
+                        context_kvlen_lod_xpu=prefill_meta.kv_lod_xpu,
+                        alibi_slopes=self.alibi_slopes,
+                        softmax_lse=None,
+                        swa_left=(
+                            self.sliding_window if self.sliding_window is not None else -1
+                        ),
+                        swa_right=0 if self.sliding_window is not None else -1,
+                        sink=(
+                            self.sinks.to(torch.float32) if self.sinks is not None else None
+                        ),
+                    )
+                else:
+                    # BF16: pass current chunk's k/v directly; kernel joins
+                    # with cached KV via block_table internally.
+                    kunlun_ops.prefill_attention(
+                        q=prefill_query,
+                        k=key_cache,
+                        v=value_cache,
+                        out=output[num_decode_tokens : attn_metadata.num_actual_tokens],
+                        is_causal=True,
+                        is_prefix_cache=True,
+                        k_perchannel_scale=k_perchannel_scale,
+                        v_perchannel_scale=v_perchannel_scale,
+                        block_table=tmp_block_tables,
+                        context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
+                        context_qlen_lod_xpu=prefill_meta.query_start_loc,
+                        context_kvlen_lod_cpu=prefill_meta.kv_lod_cpu,
+                        context_kvlen_lod_xpu=prefill_meta.kv_lod_xpu,
+                        alibi_slopes=self.alibi_slopes,
+                        softmax_lse=None,
+                        swa_left=(
+                            self.sliding_window if self.sliding_window is not None else -1
+                        ),
+                        swa_right=0 if self.sliding_window is not None else -1,
+                        sink=(
+                            self.sinks.to(torch.float32) if self.sinks is not None else None
+                        ),
+                    )
             else:
+                
                 kunlun_ops.prefill_attention(
                     q=prefill_query,
                     k=prefill_key,
                     v=prefill_value,
                     out=output[num_decode_tokens : attn_metadata.num_actual_tokens],
                     is_causal=True,
-                    alpha=_prefill_alpha,
+                    k_perchannel_scale=k_perchannel_scale,
+                    v_perchannel_scale=v_perchannel_scale,
                     context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
                     context_qlen_lod_xpu=prefill_meta.query_start_loc,
                     alibi_slopes=self.alibi_slopes,
@@ -895,48 +1384,196 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                 tmp_block_tables = (
                     decode_meta.block_tables * 2
                 )  # only test in Qwen3-Next
+            if is_int8_cache:
+                # Always reshape cache to block_size=1 layout for the unified
+                # prefill_attention + merge_state decode path.
+                #
+                # Two int8 KV cache layouts coexist:
+                #   * int8_per_token_head  (use_per_token_quant=True):
+                #       key_cache shape: (num_blocks, num_kv_heads, block_size,
+                #                         head_size + scale_pad)
+                #     The trailing ``scale_pad`` int8 elements per head row
+                #     are an *inline* float32 per-(token, head) scale, viewed
+                #     via ``self._k_scale_cache`` / ``self._v_scale_cache``
+                #     (shape ``(num_blocks, block_size, num_kv_heads)``).
+                #     We must slice the data region (``:self.head_size``)
+                #     before reshaping to a contiguous block_size=1 layout.
+                #   * int8 (use_per_token_quant=False):
+                #       key_cache shape: (num_blocks, num_kv_heads, block_size,
+                #                         head_size)
+                #     No padding; static per-channel scales come from
+                #     ``k_perchannel_scale`` / ``v_perchannel_scale``.
+                original_block_size = key_cache.shape[2]
+                num_physical_blocks = key_cache.shape[0]
+                if use_per_token_quant:
+                    # Strip trailing scale_pad before reshape; ``contiguous()``
+                    # forces a copy of just the data region.
+                    _key_cache = key_cache[..., : self.head_size].permute(
+                        0, 2, 1, 3
+                    ).reshape(
+                        num_physical_blocks * original_block_size,
+                        self.num_kv_heads,
+                        1,
+                        self.head_size,
+                    ).contiguous()
+                    _value_cache = value_cache[..., : self.head_size].permute(
+                        0, 2, 1, 3
+                    ).reshape(
+                        num_physical_blocks * original_block_size,
+                        self.num_kv_heads,
+                        1,
+                        self.head_size,
+                    ).contiguous()
 
-            # Determine batch_size and qlen based on whether it's speculative
-            if not attn_metadata.is_speculative:
-                batch_size = decode_meta.block_tables.shape[0]
-                qlen = 1
-                # Reshape q for non-speculative case
-                q = decode_query.unsqueeze(
-                    0
-                )  # [1, batch_size*qlen, head_num, head_dim]
-                out = output[:num_decode_tokens]
+                    # Inline-scale views: (num_blocks, block_size, num_kv_heads)
+                    # already in (block, slot, head) order, so just flatten the
+                    # leading two dims.
+                    assert (
+                        self._k_scale_cache is not None
+                        and self._v_scale_cache is not None
+                    ), (
+                        "Per-token-head scale views must be built by "
+                        "_ensure_scale_caches before decode."
+                    )
+                    _k_perblock_perhead = self._k_scale_cache.reshape(
+                        num_physical_blocks * original_block_size,
+                        self.num_kv_heads,
+                    ).contiguous()
+                    _v_perblock_perhead = self._v_scale_cache.reshape(
+                        num_physical_blocks * original_block_size,
+                        self.num_kv_heads,
+                    ).contiguous()
+                    _k_static = None
+                    _v_static = None
+                else:
+                    # Plain int8 cache: last dim is already self.head_size.
+                    _key_cache = key_cache.permute(0, 2, 1, 3).reshape(
+                        num_physical_blocks * original_block_size,
+                        self.num_kv_heads,
+                        1,
+                        self.head_size,
+                    ).contiguous()
+                    _value_cache = value_cache.permute(0, 2, 1, 3).reshape(
+                        num_physical_blocks * original_block_size,
+                        self.num_kv_heads,
+                        1,
+                        self.head_size,
+                    ).contiguous()
+                    _k_perblock_perhead = None
+                    _v_perblock_perhead = None
+                    _k_static = k_perchannel_scale
+                    _v_static = v_perchannel_scale
+
+                token_offsets = torch.arange(
+                    original_block_size,
+                    dtype=tmp_block_tables.dtype,
+                    device=tmp_block_tables.device,
+                )
+                tmp_block_tables = (
+                    tmp_block_tables.unsqueeze(-1) * original_block_size
+                    + token_offsets.view(1, 1, original_block_size)
+                ).reshape(tmp_block_tables.shape[0], -1).contiguous()
+
+                # Determine batch_size / qlen for both regular decode (qlen=1) and
+                # speculative decode (qlen>1).
+                if attn_metadata.is_speculative:
+                    batch_size = attn_metadata.num_decodes
+                    query_seq_len = decode_query.shape[0]
+                    assert query_seq_len % batch_size == 0
+                    qlen = query_seq_len // batch_size
+                else:
+                    batch_size = decode_meta.block_tables.shape[0]
+                    qlen = 1
+
+                if _KV_SHAPE_LOG:
+                    logger.info(
+                        "[decode_via_prefill_merge shapes] decode_query=%s "
+                        "output=%s key_cache=%s value_cache=%s "
+                        "k_perblock=%s v_perblock=%s k_static=%s v_static=%s "
+                        "context_lens_cpu=%s block_tables=%s "
+                        "tmp_block_tables=%s num_decode_tokens=%s "
+                        "batch_size=%s qlen=%s use_per_token_quant=%s",
+                        tuple(decode_query.shape),
+                        tuple(output[:num_decode_tokens].shape),
+                        tuple(_key_cache.shape),
+                        tuple(_value_cache.shape),
+                        None if _k_perblock_perhead is None
+                        else tuple(_k_perblock_perhead.shape),
+                        None if _v_perblock_perhead is None
+                        else tuple(_v_perblock_perhead.shape),
+                        None if _k_static is None else tuple(_k_static.shape),
+                        None if _v_static is None else tuple(_v_static.shape),
+                        tuple(decode_meta.seq_lens_tensor_cpu.shape),
+                        tuple(decode_meta.block_tables.shape),
+                        tuple(tmp_block_tables.shape),
+                        num_decode_tokens,
+                        batch_size,
+                        qlen,
+                        use_per_token_quant,
+                    )
+
+                logger.info_once(
+                    "USE UNIFIED DECODE: prefill_attention + merge_state "
+                    "(block_size=1)"
+                )
+                self._decode_via_prefill_merge(
+                    out=output[:num_decode_tokens].view(
+                        batch_size, qlen, self.num_heads, self.head_size
+                    ),
+                    q=decode_query.view(
+                        batch_size, qlen, self.num_heads, self.head_size
+                    ),
+                    k_cache=_key_cache,
+                    v_cache=_value_cache,
+                    block_tables=tmp_block_tables,
+                    context_lens_cpu=decode_meta.seq_lens_tensor_cpu,
+                    k_perblock_perhead_scale=_k_perblock_perhead,
+                    v_perblock_perhead_scale=_v_perblock_perhead,
+                    k_static_perchannel_scale=_k_static,
+                    v_static_perchannel_scale=_v_static,
+                )
             else:
-                batch_size = attn_metadata.num_decodes
-                query_seq_len, head_num, head_dim = decode_query.shape
-                assert query_seq_len % batch_size == 0
-                qlen = query_seq_len // batch_size
-                q = decode_query.view(batch_size, qlen, head_num, head_dim)
-                out = output[:num_decode_tokens]
-                assert out.is_contiguous()
-                out = out.view(batch_size, qlen, head_num, self.head_size)
+                # Note: bf16 kv cache calc
+                # Determine batch_size and qlen based on whether it's speculative
+                logger.info(f"bf16 kv compute")
+                if not attn_metadata.is_speculative:
+                    batch_size = decode_meta.block_tables.shape[0]
+                    qlen = 1
+                    # Reshape q for non-speculative case
+                    q = decode_query.unsqueeze(
+                        0
+                    )  # [1, batch_size*qlen, head_num, head_dim]
+                    out = output[:num_decode_tokens]
+                else:
+                    batch_size = attn_metadata.num_decodes
+                    query_seq_len, head_num, head_dim = decode_query.shape
+                    assert query_seq_len % batch_size == 0
+                    qlen = query_seq_len // batch_size
+                    q = decode_query.view(batch_size, qlen, head_num, head_dim)
+                    out = output[:num_decode_tokens]
+                    assert out.is_contiguous()
+                    out = out.view(batch_size, qlen, head_num, self.head_size)
 
-            kunlun_ops.speculative_attention(
-                out=out,
-                q=q,
-                k_cache=key_cache,
-                v_cache=value_cache,
-                context_lens_cpu=decode_meta.seq_lens_tensor_cpu,
-                context_lens_xpu=decode_meta.seq_lens_tensor,
-                batch_num=batch_size,
-                qlen=qlen,
-                max_context_len=decode_meta.max_model_len,
-                head_num=self.num_heads,
-                head_dim=self.head_size,
-                scale=self.scale,
-                kv_head_num=self.num_kv_heads,
-                block_size=key_cache.shape[2],
-                max_num_blocks_per_seq=decode_meta.block_tables.shape[1],
-                max_window_size=(
-                    self.sliding_window if self.sliding_window is not None else -1
-                ),
-                block_tables=tmp_block_tables,
-                sink=(self.sinks.to(torch.float32) if self.sinks is not None else None),
-            )
+                kunlun_ops.speculative_attention(
+                    out=out,
+                    q=q,
+                    k_cache=key_cache,
+                    v_cache=value_cache,
+                    context_lens_cpu=decode_meta.seq_lens_tensor_cpu,
+                    context_lens_xpu=decode_meta.seq_lens_tensor,
+                    batch_num=batch_size,
+                    qlen=qlen,
+                    max_context_len=decode_meta.max_model_len,
+                    head_num=self.num_heads,
+                    head_dim=self.head_size,
+                    scale=self.scale,
+                    kv_head_num=self.num_kv_heads,
+                    block_size=key_cache.shape[2],
+                    max_num_blocks_per_seq=decode_meta.block_tables.shape[1],
+                    block_tables=tmp_block_tables,
+                )
+
+
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)
 
