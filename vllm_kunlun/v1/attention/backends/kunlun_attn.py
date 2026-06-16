@@ -53,7 +53,9 @@ if TYPE_CHECKING:
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
 from vllm.v1.kv_cache_interface import AttentionSpec
+import logging
 
+logger = logging.getLogger(__name__)
 
 class KunlunAttentionBackend(AttentionBackend):
     """KunlunAttentionBackend"""
@@ -740,6 +742,23 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
             )
         self.multi_modal_placeholder_index_maps = multi_modal_placeholder_index_maps
 
+        # Dynamic per-channel KV-cache quantization state. Active only when
+        # ``self.kv_cache_dtype == "int8_dynamic_per_channel"``. Each layer
+        # owns its own per-channel **max** (the kernel divides by 127
+        # internally), shape ``[num_kv_heads, head_size]``, dtype float32,
+        # lazily allocated on the first prefill.
+        #   * prefill: ``k_scale = key.abs().amax(dim=0)`` — computed
+        #     once from the full prefill chunk and frozen.
+        #   * decode : the frozen prefill scale is reused as-is; no
+        #     recomputation or running-max update.
+        # Both are forwarded as ``k_max`` / ``v_max`` (flat,
+        # ``num_kv_heads*head_size``) to ``reshape_and_cache`` (quant_mode=1)
+        # for cache writes (prefill + decode), and as
+        # ``k_perchannel_scale`` / ``v_perchannel_scale`` to the attention
+        # kernels for in-kernel dequant.
+        self.k_scale: Optional[torch.Tensor] = None
+        self.v_scale: Optional[torch.Tensor] = None
+
     def forward(
         self,
         layer: AttentionLayer,
@@ -769,6 +788,60 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
         else:
             assert value is None
 
+        # Dynamic per-channel int8 KV-cache: compute the layer-owned
+        # per-channel max **once at prefill** from the full prefill chunk,
+        # and reuse that frozen scale for every subsequent decode step
+        # (decode does NOT recompute or update the scale). The same scale
+        # is forwarded to reshape_and_cache (quant_mode=1) for cache
+        # writes and to the attention kernels (k/v_perchannel_scale) for
+        # in-kernel dequant.
+        use_dynamic_perchannel = self.kv_cache_dtype == "int8_dynamic_per_channel"
+        k_perchannel_scale: Optional[torch.Tensor] = None
+        v_perchannel_scale: Optional[torch.Tensor] = None
+        k_max_flat: Optional[torch.Tensor] = None
+        v_max_flat: Optional[torch.Tensor] = None
+        if use_dynamic_perchannel:
+            num_prefill_tokens = attn_metadata.num_prefill_tokens
+            num_decode_tokens_meta = attn_metadata.num_decode_tokens
+            # Persistent per-channel scale buffers — allocated **once** on
+            # the first forward and updated **in place** afterward. The
+            # tensor pointer must stay stable so CUDA-graph captures the
+            # right storage and replay sees prefill's amax (instead of
+            # the unit scale seeded at warm-up). Rebinding self.k_scale
+            # to a fresh tensor every prefill (the previous behavior)
+            # caused replay to dequant against stale unit scales,
+            # producing garbage tokens like ``!!!!``.
+            if self.k_scale is None or self.v_scale is None:
+                scale_device = (
+                    key.device if key is not None else kv_cache.device
+                )
+                self.k_scale = torch.ones(
+                    self.num_kv_heads,
+                    self.head_size,
+                    dtype=torch.float32,
+                    device=scale_device,
+                )
+                self.v_scale = torch.ones_like(self.k_scale)
+            if num_prefill_tokens > 0 and key is not None and value is not None:
+                # Prefill
+                prefill_k = key[
+                    num_decode_tokens_meta : attn_metadata.num_actual_tokens
+                ].float()
+                prefill_v = value[
+                    num_decode_tokens_meta : attn_metadata.num_actual_tokens
+                ].float()
+                k_amax = prefill_k.abs().amax(dim=0)
+                v_amax = prefill_v.abs().amax(dim=0)
+                # In-place update for cudagraph.
+                self.k_scale.copy_(k_amax.clamp_min_(1e-8))
+                self.v_scale.copy_(v_amax.clamp_min_(1e-8))
+            # Decode-only forwards: leave self.k_scale / self.v_scale
+            # untouched and reuse the frozen prefill scale.
+            k_perchannel_scale = self.k_scale
+            v_perchannel_scale = self.v_scale
+            k_max_flat = self.k_scale.reshape(-1)
+            v_max_flat = self.v_scale.reshape(-1)
+
         # Self-attention vs. cross-attention will impact
         # which KV cache memory-mapping & which
         # seqlen datastructures we utilize
@@ -788,20 +861,31 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                 # Skip cache write for KV sharing layers: their cache is
                 # the target layer's cache and already contains correct values.
                 if self.kv_sharing_target_layer_name is None:
-                    # Reshape the input keys and values and store them in
-                    # the cache. If kv_cache is not provided, the new key
-                    # and value tensors are not cached. This happens during
-                    # the initial memory
                     value = value.contiguous()
                     key = key.contiguous()
-                    kunlun_ops.reshape_and_cache_flash(
-                        key[: attn_metadata.num_actual_tokens],
-                        value[: attn_metadata.num_actual_tokens],
-                        key_cache,
-                        value_cache,
-                        updated_slot_mapping,
-                        BLHD_LAYOUT=False,
-                    )
+                    if use_dynamic_perchannel:
+                        # quant_mode=1: per-channel
+                        # (num_kv_heads*head_size) max — quant + paged write
+                        # in a single fused kernel.
+                        kunlun_ops.reshape_and_cache(
+                            key[: attn_metadata.num_actual_tokens],
+                            value[: attn_metadata.num_actual_tokens],
+                            key_cache,
+                            value_cache,
+                            updated_slot_mapping.to(torch.int32),
+                            k_max=k_max_flat,
+                            v_max=v_max_flat,
+                            quant_mode=1,
+                        )
+                    else:
+                        kunlun_ops.reshape_and_cache_flash(
+                            key[: attn_metadata.num_actual_tokens],
+                            value[: attn_metadata.num_actual_tokens],
+                            key_cache,
+                            value_cache,
+                            updated_slot_mapping,
+                            BLHD_LAYOUT=False,
+                        )
 
         assert attn_type == AttentionType.DECODER
         # Decoder self-attention supports chunked prefill.
@@ -846,6 +930,8 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     is_causal=True,
                     is_prefix_cache=True,
                     alpha=_prefill_alpha,
+                    k_perchannel_scale=k_perchannel_scale,
+                    v_perchannel_scale=v_perchannel_scale,
                     block_table=tmp_block_tables,
                     context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
                     context_qlen_lod_xpu=prefill_meta.query_start_loc,
@@ -869,6 +955,8 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     out=output[num_decode_tokens : attn_metadata.num_actual_tokens],
                     is_causal=True,
                     alpha=_prefill_alpha,
+                    k_perchannel_scale=k_perchannel_scale,
+                    v_perchannel_scale=v_perchannel_scale,
                     context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
                     context_qlen_lod_xpu=prefill_meta.query_start_loc,
                     alibi_slopes=self.alibi_slopes,
@@ -931,11 +1019,17 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                 kv_head_num=self.num_kv_heads,
                 block_size=key_cache.shape[2],
                 max_num_blocks_per_seq=decode_meta.block_tables.shape[1],
-                max_window_size=(
-                    self.sliding_window if self.sliding_window is not None else -1
-                ),
+                # max_window_size=(
+                #     self.sliding_window if self.sliding_window is not None else -1
+                # ),
                 block_tables=tmp_block_tables,
-                sink=(self.sinks.to(torch.float32) if self.sinks is not None else None),
+                # sink=(self.sinks.to(torch.float32) if self.sinks is not None else None),
+                k_perchannel_scale=(
+                    k_perchannel_scale if use_dynamic_perchannel else None
+                ),
+                v_perchannel_scale=(
+                    v_perchannel_scale if use_dynamic_perchannel else None
+                ),
             )
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)

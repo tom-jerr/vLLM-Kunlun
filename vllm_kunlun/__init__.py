@@ -6,6 +6,16 @@ import logging
 import os
 import sys
 
+# Alias xtorch_ops as kunlun_ops *before* any other code can import kunlun_ops.
+# Background: in the current environment kunlun_ops's native libs are
+# incompatible with the new xpytorch runtime (undefined symbols in
+# libxops_blocks.so), and additionally kunlun_ops/libapiinfer.so collides
+# (same SONAME) with xtorch_ops/libapiinfer.so, so the two cannot coexist
+# in one process. Force every `import kunlun_ops` in this codebase to
+# resolve to xtorch_ops.
+import xtorch_ops as _xtorch_ops  # noqa: E402
+sys.modules["kunlun_ops"] = _xtorch_ops
+
 from vllm.logger import init_logger as init_vllm_logger
 
 OLD_IMPORT_HOOK = builtins.__import__
