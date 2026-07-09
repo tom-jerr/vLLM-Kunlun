@@ -91,6 +91,23 @@ from vllm_kunlun.transformers_utils.configs.qwen3_5_moe import (
     Qwen3_5MoeTextConfig,
 )
 
+# Newer transformers ships native Qwen3.5 configs; accept either type in
+# get_hf_config() so the isinstance check passes when transformers loads the
+# model config with its own class instead of vllm_kunlun's.
+try:
+    from transformers.models.qwen3_5.configuration_qwen3_5 import (
+        Qwen3_5Config as _HFQwen3_5Config,
+    )
+except ImportError:  # pragma: no cover
+    _HFQwen3_5Config = Qwen3_5Config
+
+try:
+    from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
+        Qwen3_5MoeConfig as _HFQwen3_5MoeConfig,
+    )
+except ImportError:  # pragma: no cover
+    _HFQwen3_5MoeConfig = Qwen3_5MoeConfig
+
 from .qwen3_next import (
     Qwen3NextAttention,
     Qwen3NextDecoderLayer,
@@ -105,12 +122,12 @@ logger = init_logger(__name__)
 
 class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
     def get_hf_config(self):
-        return self.ctx.get_hf_config(Qwen3_5Config)
+        return self.ctx.get_hf_config((Qwen3_5Config, _HFQwen3_5Config))
 
 
 class Qwen3_5MoeProcessingInfo(Qwen3VLProcessingInfo):
     def get_hf_config(self):
-        return self.ctx.get_hf_config(Qwen3_5MoeConfig)
+        return self.ctx.get_hf_config((Qwen3_5MoeConfig, _HFQwen3_5MoeConfig))
 
 
 class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):

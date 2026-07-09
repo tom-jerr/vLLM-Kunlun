@@ -758,6 +758,80 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
         # kernels for in-kernel dequant.
         self.k_scale: Optional[torch.Tensor] = None
         self.v_scale: Optional[torch.Tensor] = None
+        # Persistent int32 slot buffers for int8 dynamic-per-channel cache
+        # writes under CUDA graph. The quant kernel
+        # ``reshape_and_cache_quant`` (quant_mode=1) requires an **int32**
+        # slot_mapping, but ``attn_metadata.slot_mapping`` is int64. Doing
+        # ``slot_mapping.to(int32)`` (or the hybrid remap) inline allocates a
+        # fresh tensor every forward; CUDA-graph capture freezes that
+        # tensor's address, and replay reads stale/garbage slots -> KV is
+        # written to wrong physical slots -> "!!!!" garbage after N decode
+        # steps. (fp16 uses the non-quant kernel that accepts int64 directly,
+        # so it never hits this.) Fix: allocate these int32 buffers **once**
+        # with a fixed capacity (never re-alloc, never grow) and only update
+        # them in place via ``copy_``, so the captured storage pointer stays
+        # stable and current. Max decode batch is 32 tokens.
+        self._slot_buf_capacity: int = 32
+        self._slot_i32_buf: Optional[torch.Tensor] = None
+        self._write_slot_buf: Optional[torch.Tensor] = None
+        # One-shot guard so the int8 KV-cache write-back correctness check
+        # (DEBUG logging only) runs once per layer instead of every forward.
+        self._int8_kv_verified: bool = False
+
+    def _log_int8_kv_write_check(
+        self,
+        key_in: torch.Tensor,
+        key_cache: torch.Tensor,
+        slot_i32: torch.Tensor,
+        k_max_flat: torch.Tensor,
+        n_bs: int,
+        layer: "AttentionLayer",
+    ) -> None:
+        """Read back the first written token from the LOGICAL key cache and
+        compare it against the reference per-channel int8 quantization.
+
+        ``reshape_and_cache`` returns 0 even when it writes to the wrong
+        physical slots (the hybrid block-first bug), so the return code is not
+        a correctness signal. This check confirms the slot / block_table
+        remapping actually landed the data in the slot the attention kernel
+        will read back. DEBUG only; reads a single token, no hot-path cost.
+        """
+        try:
+            num_kv_heads, head_size = self.num_kv_heads, self.head_size
+            t0 = 0
+            slot0 = int(slot_i32[t0].item())
+            blk, off = slot0 // n_bs, slot0 % n_bs
+            # Logical read: what speculative_attention / prefill_attention sees.
+            got = key_cache[blk, :, off, :].to(torch.float32).cpu()  # [H, D]
+            # Reference quantization of the same token.
+            amax = k_max_flat.reshape(num_kv_heads, head_size).cpu()
+            scale = (amax / 127.0).clamp_min(1e-8)
+            ref = (
+                torch.round(key_in[t0].float().cpu() / scale)
+                .clamp_(-127, 127)
+            )
+            max_diff = (got - ref).abs().max().item()
+            ok = max_diff <= 1.0
+            logger.debug(
+                "[int8-kv][writeback-check] layer=%s slot=%d block=%d off=%d "
+                "max_diff=%.3f -> %s",
+                getattr(layer, "layer_name", "?"),
+                slot0,
+                blk,
+                off,
+                max_diff,
+                "OK (correct KV cache)" if ok else "GARBAGE (wrong slot!)",
+            )
+            if not ok:
+                logger.warning(
+                    "[int8-kv] KV cache write-back MISMATCH on layer=%s "
+                    "(max_diff=%.3f). Hybrid block-first remapping likely "
+                    "wrong -- decode will produce garbage.",
+                    getattr(layer, "layer_name", "?"),
+                    max_diff,
+                )
+        except Exception as exc:  # noqa: BLE001 - diagnostics must never crash
+            logger.debug("[int8-kv][writeback-check] skipped: %r", exc)
 
     def forward(
         self,
@@ -864,19 +938,141 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     value = value.contiguous()
                     key = key.contiguous()
                     if use_dynamic_perchannel:
-                        # quant_mode=1: per-channel
-                        # (num_kv_heads*head_size) max — quant + paged write
-                        # in a single fused kernel.
-                        kunlun_ops.reshape_and_cache(
-                            key[: attn_metadata.num_actual_tokens],
-                            value[: attn_metadata.num_actual_tokens],
-                            key_cache,
-                            value_cache,
-                            updated_slot_mapping.to(torch.int32),
+                        
+                        key_in = key[: attn_metadata.num_actual_tokens]
+                        value_in = value[: attn_metadata.num_actual_tokens]
+
+                        # Persistent int32 slot buffer for the DECODE path only.
+                        # The quant kernel requires int32 slot_mapping (it is
+                        # int64), so a conversion is unavoidable. Under CUDA
+                        # graph the decode path is captured, and an inline
+                        # ``.to(int32)`` clone gets its address frozen at
+                        # capture -> replay reads stale slots -> KV written to
+                        # wrong slots -> "!!!!" garbage. Fix: for decode use a
+                        # fixed-capacity buffer (max decode batch = 32) that is
+                        # allocated ONCE and only copy_'d into, so the captured
+                        # pointer stays valid.
+                        #
+                        # Prefill is NOT cudagraph-captured and its token count
+                        # far exceeds 32, so it must NOT use the fixed buffer;
+                        # a plain per-call ``.to(int32)`` is safe there.
+                        n_tok = updated_slot_mapping.shape[0]
+                        is_decode_only = attn_metadata.num_prefill_tokens == 0
+                        if is_decode_only:
+                            if self._slot_i32_buf is None:
+                                self._slot_i32_buf = torch.empty(
+                                    self._slot_buf_capacity,
+                                    dtype=torch.int32,
+                                    device=updated_slot_mapping.device,
+                                )
+                            assert n_tok <= self._slot_buf_capacity, (
+                                f"decode n_tok={n_tok} exceeds slot buffer "
+                                f"capacity {self._slot_buf_capacity}"
+                            )
+                            slot_i32 = self._slot_i32_buf[:n_tok]
+                            slot_i32.copy_(updated_slot_mapping)
+                        else:
+                            # Prefill / mixed batch: eager, not captured.
+                            slot_i32 = updated_slot_mapping.to(torch.int32)
+                        contiguous_cache = key_cache.is_contiguous()
+
+
+                        if contiguous_cache:
+                            write_key_cache = key_cache
+                            write_value_cache = value_cache
+                            write_slot = slot_i32
+                        else:
+                            nb_phys, n_h, n_bs, n_d = key_cache.shape
+                            hidden = n_h * n_bs * n_d
+                            phys_stride = (hidden, n_bs * n_d, n_d, 1)
+                            write_key_cache = torch.as_strided(
+                                key_cache,
+                                (2 * nb_phys, n_h, n_bs, n_d),
+                                phys_stride,
+                                0,
+                            )
+                            write_value_cache = torch.as_strided(
+                                value_cache,
+                                (2 * nb_phys - 1, n_h, n_bs, n_d),
+                                phys_stride,
+                                hidden,
+                            )
+                            blk = slot_i32 // n_bs
+                            off = slot_i32 % n_bs
+                            if is_decode_only:
+                                # Persistent buffer, same CUDA-graph reason as
+                                # slot_i32 above: allocate once, copy_ in place.
+                                if self._write_slot_buf is None:
+                                    self._write_slot_buf = torch.empty(
+                                        self._slot_buf_capacity,
+                                        dtype=torch.int32,
+                                        device=updated_slot_mapping.device,
+                                    )
+                                write_slot = self._write_slot_buf[:n_tok]
+                                write_slot.copy_((2 * blk) * n_bs + off)
+                            else:
+                                write_slot = (
+                                    (2 * blk) * n_bs + off
+                                ).to(torch.int32)
+
+                        # if attn_metadata.num_decode_tokens > 0 \
+                        #         and attn_metadata.num_prefill_tokens == 0:
+                        #     logger.info(
+                        #         "[int8-kv][decode] layer=%s num_decode_tokens=%d "
+                        #         "key_in.shape=%s value_in.shape=%s ",
+                        #         getattr(layer, "layer_name", "?"),
+                        #         attn_metadata.num_decode_tokens,
+                        #         tuple(key_in.shape),
+                        #         tuple(value_in.shape),
+                        #     )
+
+                        ret = kunlun_ops.reshape_and_cache(
+                            key_in,
+                            value_in,
+                            write_key_cache,
+                            write_value_cache,
+                            write_slot,
                             k_max=k_max_flat,
                             v_max=v_max_flat,
                             quant_mode=1,
                         )
+
+                        # KV-cache correctness logging. ``reshape_and_cache``
+                        # returns 0 even when it writes to wrong slots, so a
+                        # ret==0 alone does NOT prove the cache is correct.
+                        # On the first prefill of each layer, read back the
+                        # first written token from the LOGICAL cache and compare
+                        # against the reference quantization to confirm the
+                        # block_table / slot remapping landed in the right slot.
+                        
+                        # layout = "contiguous" if contiguous_cache else \
+                        #     "hybrid-block-first(remapped)"
+                        # logger.info(
+                        #     "[int8-kv] layer=%s layout=%s ret=%s "
+                        #     "num_tokens=%d key_cache.stride[0]=%d "
+                        #     "k_max[min/max]=%.4g/%.4g",
+                        #     getattr(layer, "layer_name", "?"),
+                        #     layout,
+                        #     ret,
+                        #     key_in.shape[0],
+                        #     key_cache.stride()[0],
+                        #     float(k_max_flat.min()),
+                        #     float(k_max_flat.max()),
+                        # )
+                        # if (
+                        #     not self._int8_kv_verified
+                        #     and key_in.shape[0] > 0
+                        # ):
+                        #     self._int8_kv_verified = True
+                        #     self._log_int8_kv_write_check(
+                        #         key_in,
+                        #         key_cache,
+                        #         slot_i32,
+                        #         k_max_flat,
+                        #         n_bs=key_cache.shape[2],
+                        #         layer=layer,
+                        #     )
+
                     else:
                         kunlun_ops.reshape_and_cache_flash(
                             key[: attn_metadata.num_actual_tokens],
@@ -930,8 +1126,8 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     is_causal=True,
                     is_prefix_cache=True,
                     alpha=_prefill_alpha,
-                    k_perchannel_scale=k_perchannel_scale,
-                    v_perchannel_scale=v_perchannel_scale,
+                    k_perchannel_scale=k_perchannel_scale if use_dynamic_perchannel else None,
+                    v_perchannel_scale=v_perchannel_scale if use_dynamic_perchannel else None,
                     block_table=tmp_block_tables,
                     context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
                     context_qlen_lod_xpu=prefill_meta.query_start_loc,
@@ -955,8 +1151,8 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     out=output[num_decode_tokens : attn_metadata.num_actual_tokens],
                     is_causal=True,
                     alpha=_prefill_alpha,
-                    k_perchannel_scale=k_perchannel_scale,
-                    v_perchannel_scale=v_perchannel_scale,
+                    k_perchannel_scale=k_perchannel_scale if use_dynamic_perchannel else None,
+                    v_perchannel_scale=v_perchannel_scale if use_dynamic_perchannel else None,
                     context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
                     context_qlen_lod_xpu=prefill_meta.query_start_loc,
                     alibi_slopes=self.alibi_slopes,
