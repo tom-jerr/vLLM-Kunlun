@@ -76,7 +76,49 @@ class KunlunCompressedTensorsConfig(CompressedTensorsConfig):
                 return quant_method
 
         if isinstance(layer, Attention):
-            return CompressedTensorsKVCacheMethod(self)
+            return KunlunCompressedTensorsKVCacheMethod(self)
         if isinstance(layer, FusedMoE):
             return KunlunCompressedTensorsMoEMethod.get_moe_method(self, layer, prefix)
         return None
+
+
+class KunlunCompressedTensorsKVCacheMethod(CompressedTensorsKVCacheMethod):
+    """Prepare the static per-head KV scale layouts after weight loading."""
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+
+        if layer.kv_cache_dtype != "int8_perchannel":
+            return
+
+        k_step = layer._k_scale
+        v_step = layer._v_scale
+        num_kv_heads = layer.impl.num_kv_heads
+        head_size = layer.impl.head_size
+        valid_scale_sizes = (1, num_kv_heads)
+        if (
+            k_step.numel() not in valid_scale_sizes
+            or v_step.numel() not in valid_scale_sizes
+        ):
+            raise ValueError(
+                "INT8 KV cache expects scalar or per-head k_scale/v_scale, "
+                f"got k={tuple(k_step.shape)}, v={tuple(v_step.shape)}, "
+                f"num_kv_heads={num_kv_heads}"
+            )
+
+        # Checkpoint scale is step=absmax/127. reshape_and_cache consumes one
+        # absmax per KV head, while attention consumes it expanded over head_dim.
+        k_cache_max = (
+            k_step.float().flatten().mul(127).expand(num_kv_heads).contiguous()
+        )
+        v_cache_max = (
+            v_step.float().flatten().mul(127).expand(num_kv_heads).contiguous()
+        )
+        k_attention_max = k_cache_max[:, None].expand(-1, head_size).contiguous()
+        v_attention_max = v_cache_max[:, None].expand(-1, head_size).contiguous()
+        layer._kunlun_kv_scale_layouts = (
+            k_cache_max,
+            v_cache_max,
+            k_attention_max,
+            v_attention_max,
+        )
